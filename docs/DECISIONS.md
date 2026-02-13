@@ -224,16 +224,126 @@ Record of all major architectural and technology decisions.
 - Focus on critical paths
 - Not 100% (diminishing returns)
 
-### CI/CD Strategy
 
-**Decision**: Progressive CI/CD (Week 3, 6, 13, 15)  
-**Date**: Day 1  
+**Decision**: Managed Inheritance with GitHub Actions Reusable Workflows  
+**Date**: Day 8 (updated from Day 1)  
 **Rationale**:
-- Week 3: Basic lint/format (establish habits)
-- Week 6: Add tests (once code exists)
-- Week 13: Add security + build (before K8s)
-- Week 15: Complete pipeline (production ready)
+- **Original plan** (Day 1): Progressive CI/CD across Weeks 3, 6, 13, 15
+- **Updated approach**: Set up centralized reusable workflow templates *before* writing any service code
+- Templates live in `.github` repo, service repos inherit via `workflow_call` (by reference, not by copy)
+- Based on the Harness Pipeline Reuse Maturity Model — targeting Level 4: Managed Inheritance
+- Update a template once → all 5 services get the change automatically on next CI run
+- Prevents "pipeline sprawl" — 7 templates + 5 thin callers
+- Progressive enablement still applies (enable jobs as services mature)
 
+**Alternatives Considered**:
+- Copy/Paste: Copy YAML per repo — leads to drift, maintenance hell with 5+ services
+- Component Reuse: Shared GitHub Actions only — reuses steps but not flows, logic still fragmented
+- Static Scaffolding: IDP/cookiecutter generates pipeline per repo — great Day 1, terrible Day 2 (Maintenance Wall)
+- Flexible Governance: Insert blocks + OPA policies — overkill for 5 services, revisit if I scale
+
+**Impact**: 
+- Platform-level CI/CD changes require editing only 1 file (the template)
+- Each service repo has a ~60-line caller YAML instead of 300+ lines of duplicated logic
+- Supports all 3 languages (Bun.js, Python, Go) from the same template set
+- Security scanner updates, tool changes, and compliance additions propagate instantly
+
+**Reference**: [Harness Pipeline Reuse Maturity Model](https://www.harness.io/harness-devops-academy/scaling-ci-cd-templates-the-pipeline-reuse-maturity-model)
+
+---
+
+### CI/CD Trigger Strategy
+
+**Decision**: Three-tier trigger model based on job cost and purpose  
+**Date**: Day 8  
+**Rationale**:
+
+**Every push (any branch)** — fast feedback:
+- `formatAndLint` — seconds to run, catches style issues immediately
+- `unitTests` — fast, no infrastructure, catches regressions early
+
+**Pull requests (targeting main/develop)** — quality gates before merge:
+- `formatAndLint` + `unitTests` (same as above)
+- `codeCoverageReport` — shows reviewers the coverage impact
+- `integrationTests` — validates with real infrastructure (Kafka, Redis, MongoDB, ES)
+- `scan` — catches vulnerabilities before they land on default branch
+
+**Push to main only** — expensive/irreversible:
+- `build` — compiles artifacts, builds and pushes Docker image to GHCR
+- `deploy` — deploys to staging (and eventually production)
+
+**Alternatives Considered**:
+- Run everything on every push: Wastes CI minutes, builds Docker images nobody will use
+- Run nothing until PR: Too late for feedback, developers find formatting issues after opening PR
+
+**Impact**: Fast developer feedback loop (push → lint + tests in ~2 min), thorough PR gates, no wasted build/deploy on feature branches
+
+---
+
+### CI/CD Tool Selection
+
+**Decision**: GitHub Actions with reusable workflows (`workflow_call`)  
+**Date**: Day 8  
+**Rationale**:
+- Native to GitHub (where all repos live) — zero additional infrastructure
+- `workflow_call` trigger enables true template-by-reference
+- Free tier: 2,000 minutes/month for private repos (more than enough)
+- Rich marketplace for actions (setup-bun, setup-go, trivy, gitleaks, etc.)
+- Built-in GitHub Environments for deployment approvals
+- SARIF upload for security findings in the Security tab
+
+**Alternatives Considered**:
+- Jenkins: Self-hosted, complex, perhaps overkill for this project
+- GitLab CI: Would require migrating repos
+- CircleCI: External service, less native GitHub integration
+- Harness: Enterprise-grade but commercial product, overkill
+- ArgoCD: Better for GitOps CD, not a full CI solution
+
+**Impact**: No additional tooling to manage, all CI/CD visible in GitHub UI
+
+---
+
+### Security Scanning Pipeline
+
+**Decision**: Four-layer security scanning in CI  
+**Date**: Day 8  
+**Rationale**:
+1. **Secret Detection** (gitleaks) — prevents committed API keys, tokens, passwords
+2. **Dependency Audit** (npm audit / pip-audit / govulncheck) — finds known CVEs in dependencies
+3. **SAST** (Semgrep) — static analysis for OWASP Top 10, security anti-patterns
+4. **Container Scanning** (Trivy) — OS and library vulnerabilities in Docker images
+
+- Initially non-blocking (continue-on-error) to avoid blocking development
+- Tighten to blocking on HIGH/CRITICAL severity by Week 12
+- SARIF upload to GitHub Security tab for visibility
+
+**Alternatives Considered**:
+- Snyk: Commercial, free tier is limited
+- SonarQube: Heavy, self-hosted, overkill for this stage
+- CodeQL: GitHub-native but slower analysis
+- No scanning: Unacceptable for enterprise-grade project
+
+**Impact**: Security gates established from day 1, progressively enforced as project matures
+
+---
+
+### Docker Registry
+
+**Decision**: GitHub Container Registry (GHCR) for Docker images  
+**Date**: Day 8  
+**Rationale**:
+- Native to GitHub — same auth, same org, same permissions
+- Free for public repos, generous limits for private
+- Supports multi-platform images (linux/amd64)
+- Automatic cleanup policies
+- Docker Buildx with GHA cache for fast builds
+
+**Alternatives Considered**:
+- Docker Hub: Rate limits on pulls, separate auth
+- AWS ECR: Vendor lock-in, requires AWS account
+- Self-hosted: Maintenance overhead
+
+**Impact**: Docker images live alongside code in the same GitHub org
 ---
 
 ## Template for New Decisions

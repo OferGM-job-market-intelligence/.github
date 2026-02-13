@@ -1,0 +1,107 @@
+# =============================================================================
+# CI/CD Pipeline — Go Service (Aggregation / Auth)
+# =============================================================================
+# Caller workflow inheriting from centralized templates.
+# Template Source: OferGM-job-market-intelligence/.github
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Code Quality (runs in parallel)
+  # ---------------------------------------------------------------------------
+  format-and-lint:
+    name: Format & Lint
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-format-and-lint.yml@main
+    with:
+      language: go
+      go_version: "1.21"
+      fail_on_warnings: true  # Go linting is stricter — enforce it
+
+  unit-tests:
+    name: Unit Tests
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-unit-tests.yml@main
+    with:
+      language: go
+      go_version: "1.21"
+      min_coverage: 0  # Set to 80 once tests are mature
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Coverage & Security
+  # ---------------------------------------------------------------------------
+  code-coverage:
+    name: Coverage Report
+    needs: [unit-tests]
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-code-coverage.yml@main
+    with:
+      language: go
+      go_version: "1.21"
+      min_coverage: 80
+
+  scan:
+    name: Security Scan
+    needs: [format-and-lint]
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-scan.yml@main
+    with:
+      language: go
+      go_version: "1.21"
+      scan_docker_image: false
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: Integration Tests
+  # Auth Service needs Redis (session/token cache) and MongoDB (user store)
+  # Aggregation Service needs Kafka, MongoDB, Elasticsearch, Redis
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Integration Tests
+    needs: [format-and-lint, unit-tests]
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-integration-tests.yml@main
+    with:
+      language: go
+      go_version: "1.21"
+      needs_kafka: true        # ← Adjust per Go service
+      needs_redis: true
+      needs_mongodb: true
+      needs_elasticsearch: true
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: Build
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & Push
+    needs: [code-coverage, scan, integration-tests]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-build.yml@main
+    with:
+      language: go
+      go_version: "1.21"
+      docker_push: ${{ github.ref == 'refs/heads/main' }}
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: Deploy
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-deploy.yml@main
+    with:
+      environment: staging
+      service_name: aggregation-service       # ← Change per Go service
+      docker_image: ${{ needs.build.outputs.docker_image }}
+      health_check_path: /health
+    secrets:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_STAGING }}

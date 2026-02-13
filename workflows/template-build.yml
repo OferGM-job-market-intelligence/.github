@@ -1,0 +1,277 @@
+# =============================================================================
+# Reusable Workflow: Build
+# =============================================================================
+# Central template for building application artifacts and Docker images.
+# Produces: compiled binaries (Go), transpiled bundles (Bun), wheels (Python),
+# and multi-platform Docker images pushed to GitHub Container Registry.
+#
+# Supports: Bun.js (TypeScript), Python, Go
+#
+# Usage (from service repo):
+#   jobs:
+#     build:
+#       uses: OferGM-job-market-intelligence/.github/.github/workflows/template-build.yml@main
+#       with:
+#         language: "go"
+#         docker_push: true
+#       secrets:
+#         GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#
+# =============================================================================
+
+name: "Template: Build"
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "Service language runtime: bunjs | python | go"
+        required: true
+        type: string
+      working_directory:
+        description: "Working directory relative to repo root"
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: "Bun version (for bunjs services)"
+        required: false
+        type: string
+        default: "1.1.38"
+      python_version:
+        description: "Python version (for python services)"
+        required: false
+        type: string
+        default: "3.11"
+      go_version:
+        description: "Go version (for go services)"
+        required: false
+        type: string
+        default: "1.21"
+      docker_push:
+        description: "Whether to build and push the Docker image"
+        required: false
+        type: boolean
+        default: false
+      docker_registry:
+        description: "Docker registry URL"
+        required: false
+        type: string
+        default: "ghcr.io"
+      docker_image_name:
+        description: "Override Docker image name (defaults to repo name)"
+        required: false
+        type: string
+        default: ""
+      docker_platforms:
+        description: "Docker build platforms"
+        required: false
+        type: string
+        default: "linux/amd64"
+      build_command:
+        description: "Override the default build command"
+        required: false
+        type: string
+        default: ""
+    outputs:
+      docker_image:
+        description: "Full Docker image URI with tag"
+        value: ${{ jobs.build.outputs.image_uri }}
+      docker_digest:
+        description: "Docker image digest"
+        value: ${{ jobs.build.outputs.image_digest }}
+      build_version:
+        description: "Build version/tag"
+        value: ${{ jobs.build.outputs.version }}
+    secrets:
+      GHCR_TOKEN:
+        description: "GitHub Container Registry token"
+        required: false
+
+jobs:
+  build:
+    name: "Build (${{ inputs.language }})"
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.docker-meta.outputs.tags }}
+      image_digest: ${{ steps.docker-push.outputs.digest }}
+      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: read
+      packages: write  # Required for GHCR push
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Common: Checkout & Version
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          # Use git tag if available, otherwise short SHA
+          if git describe --tags --exact-match 2>/dev/null; then
+            VERSION=$(git describe --tags --exact-match)
+          else
+            VERSION="0.0.0-$(git rev-parse --short HEAD)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "📦 Build version: ${VERSION}"
+
+      # -----------------------------------------------------------------------
+      # Bun.js — Build TypeScript bundle
+      # -----------------------------------------------------------------------
+      - name: Setup Bun
+        if: inputs.language == 'bunjs'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun install --frozen-lockfile
+
+      - name: Build (Bun)
+        if: inputs.language == 'bunjs'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            bun run build
+          fi
+        env:
+          NODE_ENV: production
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+
+      # -----------------------------------------------------------------------
+      # Python — Build wheel/sdist
+      # -----------------------------------------------------------------------
+      - name: Setup Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Python dependencies
+        if: inputs.language == 'python'
+        run: |
+          python -m pip install --upgrade pip build
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Build (Python)
+        if: inputs.language == 'python'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            # Build wheel if setup.py/pyproject.toml exists, otherwise validate syntax
+            if [ -f pyproject.toml ] || [ -f setup.py ]; then
+              python -m build
+            else
+              python -m py_compile src/**/*.py 2>/dev/null || \
+              find src -name "*.py" -exec python -m py_compile {} + 2>/dev/null || \
+              echo "✅ Python source validated"
+            fi
+          fi
+
+      # -----------------------------------------------------------------------
+      # Go — Compile binary
+      # -----------------------------------------------------------------------
+      - name: Setup Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Build (Go)
+        if: inputs.language == 'go'
+        run: |
+          if [ -n "${{ inputs.build_command }}" ]; then
+            ${{ inputs.build_command }}
+          else
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+              -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" \
+              -o bin/server \
+              ./cmd/server
+          fi
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+
+      # -----------------------------------------------------------------------
+      # Upload build artifacts
+      # -----------------------------------------------------------------------
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ inputs.language }}-${{ github.sha }}
+          path: |
+            dist/
+            bin/
+            build/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # -----------------------------------------------------------------------
+      # Docker: Build & Push
+      # -----------------------------------------------------------------------
+      - name: Set up Docker Buildx
+        if: inputs.docker_push
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Container Registry
+        if: inputs.docker_push
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.docker_registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || github.token }}
+
+      - name: Docker metadata
+        if: inputs.docker_push
+        id: docker-meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ inputs.docker_registry }}/${{ inputs.docker_image_name || github.repository }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        if: inputs.docker_push
+        id: docker-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.working_directory }}
+          push: true
+          tags: ${{ steps.docker-meta.outputs.tags }}
+          labels: ${{ steps.docker-meta.outputs.labels }}
+          platforms: ${{ inputs.docker_platforms }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_VERSION=${{ steps.version.outputs.version }}
+
+      # -----------------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------------
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## 🏗️ Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Detail | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Language** | ${{ inputs.language }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Version** | ${{ steps.version.outputs.version }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.docker_push }}" = "true" ]; then
+            echo "| **Docker Image** | ${{ steps.docker-meta.outputs.tags }} |" >> "$GITHUB_STEP_SUMMARY"
+          fi

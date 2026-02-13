@@ -189,6 +189,65 @@ User login
 
 ## 🚀 Deployment Strategy
 
+## 🔄 CI/CD Architecture
+
+### Pipeline Inheritance Model (L4)
+
+All CI/CD logic is centralized in the `.github` repo as reusable workflows.
+Service repos contain thin ~60-line caller YAMLs that inherit by reference.
+
+```
+.github repo (templates)          Service repos (callers)
+┌──────────────────────┐          ┌─────────────────────┐
+│ template-format-lint │◄─────────│ scraper-service     │
+│ template-unit-tests  │◄─────────│ api-gateway         │
+│ template-integ-tests │◄─────────│ nlp-service         │
+│ template-coverage    │◄─────────│ aggregation-service │
+│ template-scan        │◄─────────│ auth-service        │
+│ template-build       │          └─────────────────────┘
+│ template-deploy      │          workflow_call (by ref)
+└──────────────────────┘
+```
+
+### Pipeline Stages
+
+```
+Push (any branch)         Pull Request              Push to main
+─────────────────         ────────────              ────────────
+ formatAndLint ──┐         formatAndLint             build
+ unitTests ──────┤         unitTests                   │
+                 │         codeCoverage               deploy
+                 │         integrationTests         (staging)
+                 │         scan                        │
+                 │                                   deploy
+                 │                                (production)
+                 └─► Fast feedback (~2 min)
+```
+
+### Security Scanning Layers
+1. **gitleaks** — Secret detection (committed API keys, tokens)
+2. **Dependency audit** — npm audit / pip-audit / govulncheck
+3. **Semgrep SAST** — Static analysis (OWASP Top 10)
+4. **Trivy** — Container image vulnerabilities
+
+### Docker Images
+- **Registry**: GitHub Container Registry (ghcr.io)
+- **Build**: Docker Buildx with GHA cache
+- **Tags**: SHA, branch, semver, latest (on main)
+- **Platforms**: linux/amd64
+
+### Deployment
+- **Staging**: Auto-deploy on push to main
+- **Production**: Manual approval via GitHub Environments
+- **Strategy**: Rolling (default), canary (production)
+- **Safety**: Health check + auto-rollback on failure
+
+---
+
+### Update "Related Documentation" section:
+
+- [CI/CD Templates](../../.github/.github/workflows/) — Reusable workflow templates
+
 ### Local Development
 - Docker Compose for infrastructure
 - Each service runs independently

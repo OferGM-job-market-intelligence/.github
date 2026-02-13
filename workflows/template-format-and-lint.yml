@@ -1,0 +1,159 @@
+# =============================================================================
+# Reusable Workflow: Format & Lint
+# =============================================================================
+# Central template for formatting and linting across all services.
+# Supports: Bun.js (TypeScript), Python, Go
+#
+# Usage (from service repo):
+#   jobs:
+#     format-and-lint:
+#       uses: OferGM-job-market-intelligence/.github/.github/workflows/template-format-and-lint.yml@main
+#       with:
+#         language: "bunjs"  # or "python" or "go"
+#
+# =============================================================================
+
+name: "Template: Format & Lint"
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "Service language runtime: bunjs | python | go"
+        required: true
+        type: string
+      working_directory:
+        description: "Working directory relative to repo root"
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: "Node/Bun version (for bunjs services)"
+        required: false
+        type: string
+        default: "1.1.38"
+      python_version:
+        description: "Python version (for python services)"
+        required: false
+        type: string
+        default: "3.11"
+      go_version:
+        description: "Go version (for go services)"
+        required: false
+        type: string
+        default: "1.21"
+      fail_on_warnings:
+        description: "Whether lint warnings should fail the job"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  format-and-lint:
+    name: "Format & Lint (${{ inputs.language }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Common: Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Bun.js (TypeScript) — Biome / ESLint + Prettier
+      # -----------------------------------------------------------------------
+      - name: Setup Bun
+        if: inputs.language == 'bunjs'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun install --frozen-lockfile
+
+      - name: Check formatting (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun run format:check
+        # Expects package.json script: "format:check": "biome check --formatter-enabled=true --linter-enabled=false ."
+        # Or: "format:check": "prettier --check ."
+
+      - name: Lint (Bun)
+        if: inputs.language == 'bunjs'
+        run: |
+          if [ "${{ inputs.fail_on_warnings }}" = "true" ]; then
+            bun run lint --max-warnings=0
+          else
+            bun run lint
+          fi
+        # Expects package.json script: "lint": "biome lint ." or "lint": "eslint ."
+
+      - name: Type check (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun run typecheck
+        # Expects package.json script: "typecheck": "tsc --noEmit"
+
+      # -----------------------------------------------------------------------
+      # Python — Ruff (format + lint) + mypy
+      # -----------------------------------------------------------------------
+      - name: Setup Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Python dependencies
+        if: inputs.language == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Check formatting (Python — Ruff)
+        if: inputs.language == 'python'
+        run: ruff format --check .
+
+      - name: Lint (Python — Ruff)
+        if: inputs.language == 'python'
+        run: ruff check .
+
+      - name: Type check (Python — mypy)
+        if: inputs.language == 'python'
+        run: mypy . --ignore-missing-imports
+        continue-on-error: true  # mypy can be strict; allow gradual adoption
+
+      # -----------------------------------------------------------------------
+      # Go — gofmt + golangci-lint + go vet
+      # -----------------------------------------------------------------------
+      - name: Setup Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Check formatting (Go — gofmt)
+        if: inputs.language == 'go'
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "❌ The following files are not formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+          echo "✅ All files formatted correctly"
+
+      - name: Lint (Go — golangci-lint)
+        if: inputs.language == 'go'
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: ${{ inputs.working_directory }}
+
+      - name: Vet (Go)
+        if: inputs.language == 'go'
+        run: go vet ./...

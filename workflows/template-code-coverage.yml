@@ -1,0 +1,205 @@
+# =============================================================================
+# Reusable Workflow: Code Coverage Report
+# =============================================================================
+# Central template for generating and publishing code coverage reports.
+# Downloads coverage artifacts from the unit-tests job and produces
+# a unified PR comment + badge.
+#
+# Supports: Bun.js (TypeScript), Python, Go
+#
+# Usage (from service repo):
+#   jobs:
+#     coverage-report:
+#       needs: [unit-tests]
+#       uses: OferGM-job-market-intelligence/.github/.github/workflows/template-code-coverage.yml@main
+#       with:
+#         language: "python"
+#         min_coverage: 80
+#
+# =============================================================================
+
+name: "Template: Code Coverage Report"
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "Service language runtime: bunjs | python | go"
+        required: true
+        type: string
+      working_directory:
+        description: "Working directory relative to repo root"
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: "Bun version (for bunjs services)"
+        required: false
+        type: string
+        default: "1.1.38"
+      python_version:
+        description: "Python version (for python services)"
+        required: false
+        type: string
+        default: "3.11"
+      go_version:
+        description: "Go version (for go services)"
+        required: false
+        type: string
+        default: "1.21"
+      min_coverage:
+        description: "Minimum coverage percentage to pass"
+        required: false
+        type: number
+        default: 80
+      upload_to_codecov:
+        description: "Whether to upload coverage to Codecov"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      CODECOV_TOKEN:
+        description: "Codecov upload token"
+        required: false
+
+jobs:
+  code-coverage:
+    name: "Coverage Report (${{ inputs.language }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Common: Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Generate coverage — we re-run tests with coverage instrumentation
+      # to ensure a fresh, accurate report.
+      # -----------------------------------------------------------------------
+
+      # -- Bun.js --------------------------------------------------------------
+      - name: Setup Bun
+        if: inputs.language == 'bunjs'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun install --frozen-lockfile
+
+      - name: Generate coverage (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun test --coverage 2>&1 | tee coverage-output.txt
+
+      - name: Parse & validate coverage (Bun)
+        if: inputs.language == 'bunjs'
+        id: bun-cov
+        run: |
+          # Extract coverage percentage from Bun's output
+          COVERAGE=$(grep -E "^All files" coverage-output.txt | awk '{print $4}' | tr -d '%' || echo "0")
+          echo "coverage=${COVERAGE:-0}" >> "$GITHUB_OUTPUT"
+          echo "## 📊 Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Coverage** | ${COVERAGE:-0}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Minimum** | ${{ inputs.min_coverage }}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Language** | Bun.js (TypeScript) |" >> "$GITHUB_STEP_SUMMARY"
+
+      # -- Python --------------------------------------------------------------
+      - name: Setup Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install Python dependencies
+        if: inputs.language == 'python'
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Generate coverage (Python)
+        if: inputs.language == 'python'
+        run: |
+          python -m pytest tests/unit/ \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov \
+            -v
+
+      - name: Parse & validate coverage (Python)
+        if: inputs.language == 'python'
+        id: python-cov
+        run: |
+          COVERAGE=$(python -m coverage report --format=total 2>/dev/null || \
+            python -m pytest tests/unit/ --cov=src --cov-report=term 2>&1 | grep "^TOTAL" | awk '{print $NF}' | tr -d '%' || \
+            echo "0")
+          echo "coverage=${COVERAGE:-0}" >> "$GITHUB_OUTPUT"
+          echo "## 📊 Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Coverage** | ${COVERAGE:-0}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Minimum** | ${{ inputs.min_coverage }}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Language** | Python ${{ inputs.python_version }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      # -- Go ------------------------------------------------------------------
+      - name: Setup Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Generate coverage (Go)
+        if: inputs.language == 'go'
+        run: |
+          go test ./... \
+            -coverprofile=coverage.out \
+            -covermode=atomic \
+            -short
+
+      - name: Parse & validate coverage (Go)
+        if: inputs.language == 'go'
+        id: go-cov
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep "^total:" | awk '{print $3}' | tr -d '%' || echo "0")
+          echo "coverage=${COVERAGE:-0}" >> "$GITHUB_OUTPUT"
+          # Generate HTML report
+          go tool cover -html=coverage.out -o coverage.html
+          echo "## 📊 Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Coverage** | ${COVERAGE:-0}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Minimum** | ${{ inputs.min_coverage }}% |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Language** | Go ${{ inputs.go_version }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # Common: Coverage gate
+      # -----------------------------------------------------------------------
+      - name: Enforce coverage threshold
+        run: |
+          COV="${{ steps.bun-cov.outputs.coverage || steps.python-cov.outputs.coverage || steps.go-cov.outputs.coverage || '0' }}"
+          MIN="${{ inputs.min_coverage }}"
+          echo "📊 Coverage: ${COV}% | Minimum required: ${MIN}%"
+
+          if [ "$(echo "$COV < $MIN" | bc -l)" -eq 1 ]; then
+            echo "❌ FAILED: Coverage ${COV}% is below minimum ${MIN}%"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### ❌ Coverage Gate: FAILED" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          echo "✅ PASSED: Coverage ${COV}% meets minimum ${MIN}%"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ✅ Coverage Gate: PASSED" >> "$GITHUB_STEP_SUMMARY"

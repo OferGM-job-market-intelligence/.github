@@ -1,0 +1,282 @@
+# =============================================================================
+# Reusable Workflow: Deploy
+# =============================================================================
+# Central template for deploying services to Kubernetes (or Docker Compose
+# for staging). Supports rolling and canary deployment strategies.
+#
+# Usage (from service repo):
+#   jobs:
+#     deploy:
+#       needs: [build]
+#       uses: OferGM-job-market-intelligence/.github/.github/workflows/template-deploy.yml@main
+#       with:
+#         environment: "staging"
+#         service_name: "scraper-service"
+#         docker_image: ${{ needs.build.outputs.docker_image }}
+#       secrets:
+#         KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+#
+# =============================================================================
+
+name: "Template: Deploy"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Deployment environment: staging | production"
+        required: true
+        type: string
+      service_name:
+        description: "Name of the service to deploy"
+        required: true
+        type: string
+      docker_image:
+        description: "Full Docker image URI with tag to deploy"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace"
+        required: false
+        type: string
+        default: ""
+      deployment_strategy:
+        description: "Deployment strategy: rolling | canary"
+        required: false
+        type: string
+        default: "rolling"
+      health_check_path:
+        description: "HTTP path for health check after deployment"
+        required: false
+        type: string
+        default: "/health"
+      health_check_timeout:
+        description: "Seconds to wait for health check to pass"
+        required: false
+        type: number
+        default: 120
+      helm_chart_path:
+        description: "Path to Helm chart (relative to infrastructure repo)"
+        required: false
+        type: string
+        default: ""
+      helm_values_file:
+        description: "Path to environment-specific values file"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Perform a dry run without actually deploying"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      KUBE_CONFIG:
+        description: "Base64-encoded kubeconfig"
+        required: false
+      DEPLOY_TOKEN:
+        description: "Deployment authorization token"
+        required: false
+
+jobs:
+  deploy:
+    name: "Deploy ${{ inputs.service_name }} → ${{ inputs.environment }}"
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ steps.deploy-url.outputs.url }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Checkout — needed for Helm charts and k8s manifests
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Pre-deploy: Validate inputs
+      # -----------------------------------------------------------------------
+      - name: Validate deployment inputs
+        run: |
+          echo "🚀 Deployment Plan"
+          echo "  Service:     ${{ inputs.service_name }}"
+          echo "  Environment: ${{ inputs.environment }}"
+          echo "  Image:       ${{ inputs.docker_image }}"
+          echo "  Strategy:    ${{ inputs.deployment_strategy }}"
+          echo "  Namespace:   ${{ inputs.namespace || inputs.environment }}"
+          echo "  Dry Run:     ${{ inputs.dry_run }}"
+
+          # Prevent accidental production deploys from non-main branches
+          if [ "${{ inputs.environment }}" = "production" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "❌ Production deploys are only allowed from the main branch."
+            echo "   Current ref: ${{ github.ref }}"
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # Setup kubectl
+      # -----------------------------------------------------------------------
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig
+        if: secrets.KUBE_CONFIG != ''
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      # -----------------------------------------------------------------------
+      # Setup Helm (if using Helm charts)
+      # -----------------------------------------------------------------------
+      - name: Setup Helm
+        if: inputs.helm_chart_path != ''
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      # -----------------------------------------------------------------------
+      # Deploy: Helm-based deployment
+      # -----------------------------------------------------------------------
+      - name: Deploy with Helm
+        if: inputs.helm_chart_path != ''
+        run: |
+          NAMESPACE="${{ inputs.namespace || inputs.environment }}"
+          RELEASE="${{ inputs.service_name }}"
+          CHART="${{ inputs.helm_chart_path }}"
+          DRY_RUN_FLAG=""
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          VALUES_FLAG=""
+          if [ -n "${{ inputs.helm_values_file }}" ]; then
+            VALUES_FLAG="-f ${{ inputs.helm_values_file }}"
+          fi
+
+          helm upgrade --install "$RELEASE" "$CHART" \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            --set image.repository=$(echo "${{ inputs.docker_image }}" | cut -d: -f1) \
+            --set image.tag=$(echo "${{ inputs.docker_image }}" | cut -d: -f2) \
+            --set env=${{ inputs.environment }} \
+            --wait \
+            --timeout 5m \
+            $VALUES_FLAG \
+            $DRY_RUN_FLAG
+
+      # -----------------------------------------------------------------------
+      # Deploy: kubectl-based deployment (fallback when no Helm chart)
+      # -----------------------------------------------------------------------
+      - name: Deploy with kubectl
+        if: inputs.helm_chart_path == '' && secrets.KUBE_CONFIG != ''
+        run: |
+          NAMESPACE="${{ inputs.namespace || inputs.environment }}"
+          DRY_RUN_FLAG=""
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run=client"
+          fi
+
+          # Update the deployment image
+          kubectl set image deployment/${{ inputs.service_name }} \
+            ${{ inputs.service_name }}=${{ inputs.docker_image }} \
+            --namespace "$NAMESPACE" \
+            $DRY_RUN_FLAG
+
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            # Wait for rollout to complete
+            kubectl rollout status deployment/${{ inputs.service_name }} \
+              --namespace "$NAMESPACE" \
+              --timeout=${{ inputs.health_check_timeout }}s
+          fi
+
+      # -----------------------------------------------------------------------
+      # Post-deploy: Health check
+      # -----------------------------------------------------------------------
+      - name: Health check
+        if: "!inputs.dry_run"
+        id: health-check
+        run: |
+          echo "⏳ Waiting for ${{ inputs.service_name }} to become healthy..."
+          NAMESPACE="${{ inputs.namespace || inputs.environment }}"
+          TIMEOUT=${{ inputs.health_check_timeout }}
+          ELAPSED=0
+
+          # Get the service endpoint (for local/staging, use port-forward)
+          # For production with ingress, query the ingress URL directly.
+          # This is a generic approach using kubectl port-forward.
+          SERVICE_PORT=$(kubectl get svc ${{ inputs.service_name }} \
+            --namespace "$NAMESPACE" \
+            -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "8080")
+
+          kubectl port-forward svc/${{ inputs.service_name }} \
+            8888:${SERVICE_PORT} \
+            --namespace "$NAMESPACE" &
+          PF_PID=$!
+          sleep 3
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            if curl -sf "http://localhost:8888${{ inputs.health_check_path }}" > /dev/null 2>&1; then
+              echo "✅ ${{ inputs.service_name }} is healthy!"
+              kill $PF_PID 2>/dev/null || true
+              exit 0
+            fi
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+            echo "  ⏳ Waiting... (${ELAPSED}s / ${TIMEOUT}s)"
+          done
+
+          kill $PF_PID 2>/dev/null || true
+          echo "❌ Health check timed out after ${TIMEOUT}s"
+          exit 1
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Rollback on failure
+      # -----------------------------------------------------------------------
+      - name: Rollback on failure
+        if: failure() && !inputs.dry_run && secrets.KUBE_CONFIG != ''
+        run: |
+          NAMESPACE="${{ inputs.namespace || inputs.environment }}"
+          echo "⚠️ Deployment failed — rolling back ${{ inputs.service_name }}..."
+          kubectl rollout undo deployment/${{ inputs.service_name }} \
+            --namespace "$NAMESPACE"
+          kubectl rollout status deployment/${{ inputs.service_name }} \
+            --namespace "$NAMESPACE" \
+            --timeout=120s
+          echo "✅ Rollback complete"
+
+      # -----------------------------------------------------------------------
+      # Output: Deployment URL
+      # -----------------------------------------------------------------------
+      - name: Set deployment URL
+        id: deploy-url
+        run: |
+          if [ "${{ inputs.environment }}" = "production" ]; then
+            echo "url=https://api.jobmarketintelligence.dev/${{ inputs.service_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=https://${{ inputs.environment }}.jobmarketintelligence.dev/${{ inputs.service_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------------
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "## 🚀 Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Detail | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Service** | ${{ inputs.service_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Environment** | ${{ inputs.environment }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Image** | \`${{ inputs.docker_image }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Strategy** | ${{ inputs.deployment_strategy }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Dry Run** | ${{ inputs.dry_run }} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            echo "| **Health Check** | ${{ steps.health-check.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          fi

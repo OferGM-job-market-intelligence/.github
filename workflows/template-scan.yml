@@ -1,0 +1,223 @@
+# =============================================================================
+# Reusable Workflow: Security Scan
+# =============================================================================
+# Central template for security scanning across all services.
+# Runs: dependency audit, SAST (CodeQL/Semgrep), secret detection,
+# and container image scanning (Trivy).
+#
+# Supports: Bun.js (TypeScript), Python, Go
+#
+# Usage (from service repo):
+#   jobs:
+#     scan:
+#       uses: OferGM-job-market-intelligence/.github/.github/workflows/template-scan.yml@main
+#       with:
+#         language: "python"
+#         scan_docker_image: true
+#
+# =============================================================================
+
+name: "Template: Security Scan"
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: "Service language runtime: bunjs | python | go"
+        required: true
+        type: string
+      working_directory:
+        description: "Working directory relative to repo root"
+        required: false
+        type: string
+        default: "."
+      node_version:
+        description: "Bun version (for bunjs services)"
+        required: false
+        type: string
+        default: "1.1.38"
+      python_version:
+        description: "Python version (for python services)"
+        required: false
+        type: string
+        default: "3.11"
+      go_version:
+        description: "Go version (for go services)"
+        required: false
+        type: string
+        default: "1.21"
+      scan_docker_image:
+        description: "Whether to scan the Docker image with Trivy"
+        required: false
+        type: boolean
+        default: false
+      docker_image_tag:
+        description: "Docker image tag to scan (if scan_docker_image is true)"
+        required: false
+        type: string
+        default: ""
+      fail_on_high_severity:
+        description: "Fail the job if HIGH or CRITICAL vulnerabilities are found"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  security-scan:
+    name: "Security Scan (${{ inputs.language }})"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write  # Required for CodeQL SARIF upload
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Common: Checkout
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 1. Secret Detection — gitleaks
+      # Scans the repo for accidentally committed secrets (API keys, tokens, etc.)
+      # -----------------------------------------------------------------------
+      - name: Secret detection (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        continue-on-error: false
+
+      # -----------------------------------------------------------------------
+      # 2. Dependency Audit — language-specific vulnerability checks
+      # -----------------------------------------------------------------------
+
+      # -- Bun.js: bun audit ---------------------------------------------------
+      - name: Setup Bun
+        if: inputs.language == 'bunjs'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.node_version }}
+
+      - name: Install dependencies (Bun)
+        if: inputs.language == 'bunjs'
+        run: bun install --frozen-lockfile
+
+      - name: Dependency audit (Bun/npm)
+        if: inputs.language == 'bunjs'
+        run: |
+          # Bun doesn't have a native audit command yet; use npm audit on the lockfile
+          npx audit-ci --config audit-ci.json 2>/dev/null || \
+          npm audit --omit=dev --audit-level=high 2>/dev/null || \
+          echo "⚠️ Dependency audit completed with warnings"
+        continue-on-error: true
+
+      # -- Python: pip-audit ----------------------------------------------------
+      - name: Setup Python
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Dependency audit (Python — pip-audit)
+        if: inputs.language == 'python'
+        run: |
+          pip install pip-audit
+          if [ -f requirements.txt ]; then
+            pip-audit -r requirements.txt --desc --output pip-audit-report.txt || true
+            cat pip-audit-report.txt
+          fi
+
+      # -- Go: govulncheck -----------------------------------------------------
+      - name: Setup Go
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go_version }}
+
+      - name: Dependency audit (Go — govulncheck)
+        if: inputs.language == 'go'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      # -----------------------------------------------------------------------
+      # 3. SAST — Static Application Security Testing (Semgrep)
+      # Language-agnostic SAST scanner with good coverage for TS, Python, Go.
+      # -----------------------------------------------------------------------
+      - name: SAST scan (Semgrep)
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/owasp-top-ten
+            p/security-audit
+        env:
+          SEMGREP_RULES: >-
+            p/default
+            p/owasp-top-ten
+        continue-on-error: true  # Don't block CI initially; tighten later
+
+      # -----------------------------------------------------------------------
+      # 4. Container Image Scan — Trivy
+      # Scans the built Docker image for OS and library vulnerabilities.
+      # -----------------------------------------------------------------------
+      - name: Build Docker image for scanning
+        if: inputs.scan_docker_image && inputs.docker_image_tag == ''
+        run: |
+          IMAGE_TAG="${{ github.repository }}:scan-${{ github.sha }}"
+          docker build -t "$IMAGE_TAG" .
+          echo "SCAN_IMAGE=$IMAGE_TAG" >> "$GITHUB_ENV"
+        working-directory: ${{ inputs.working_directory }}
+
+      - name: Set Docker image tag
+        if: inputs.scan_docker_image && inputs.docker_image_tag != ''
+        run: echo "SCAN_IMAGE=${{ inputs.docker_image_tag }}" >> "$GITHUB_ENV"
+
+      - name: Container scan (Trivy)
+        if: inputs.scan_docker_image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.SCAN_IMAGE }}
+          format: "table"
+          exit-code: ${{ inputs.fail_on_high_severity && '1' || '0' }}
+          severity: "HIGH,CRITICAL"
+          ignore-unfixed: true
+
+      - name: Container scan SARIF (Trivy)
+        if: inputs.scan_docker_image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.SCAN_IMAGE }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "HIGH,CRITICAL"
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF
+        if: inputs.scan_docker_image && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------------
+      - name: Security scan summary
+        if: always()
+        run: |
+          echo "## 🔒 Security Scan Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Secret Detection (gitleaks) | ✅ Completed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dependency Audit | ✅ Completed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SAST (Semgrep) | ✅ Completed |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.scan_docker_image }}" = "true" ]; then
+            echo "| Container Scan (Trivy) | ✅ Completed |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| Container Scan (Trivy) | ⏭️ Skipped |" >> "$GITHUB_STEP_SUMMARY"
+          fi

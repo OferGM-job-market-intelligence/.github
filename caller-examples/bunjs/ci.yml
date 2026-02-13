@@ -1,0 +1,123 @@
+# =============================================================================
+# CI/CD Pipeline — Bun.js Service
+# =============================================================================
+# This is the CALLER workflow that lives in each Bun.js service repo.
+# It inherits all CI/CD logic from the centralized templates in .github repo.
+#
+# Template Source: OferGM-job-market-intelligence/.github
+#
+# When the platform updates a template (e.g., adds a new security scanner),
+# every service inheriting that template gets the update automatically.
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Code Quality (runs in parallel)
+  # ---------------------------------------------------------------------------
+  format-and-lint:
+    name: Format & Lint
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-format-and-lint.yml@main
+    with:
+      language: bunjs
+      node_version: "1.1.38"
+      fail_on_warnings: false
+
+  unit-tests:
+    name: Unit Tests
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-unit-tests.yml@main
+    with:
+      language: bunjs
+      node_version: "1.1.38"
+      min_coverage: 0  # Set to 80 once tests are mature
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Coverage & Security (after unit tests pass)
+  # ---------------------------------------------------------------------------
+  code-coverage:
+    name: Coverage Report
+    needs: [unit-tests]
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-code-coverage.yml@main
+    with:
+      language: bunjs
+      node_version: "1.1.38"
+      min_coverage: 80
+
+  scan:
+    name: Security Scan
+    needs: [format-and-lint]
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-scan.yml@main
+    with:
+      language: bunjs
+      node_version: "1.1.38"
+      scan_docker_image: false  # Enable after Dockerfile is created
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: Integration Tests (after code quality passes)
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Integration Tests
+    needs: [format-and-lint, unit-tests]
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-integration-tests.yml@main
+    with:
+      language: bunjs
+      node_version: "1.1.38"
+      needs_kafka: true     # Scraper publishes to Kafka
+      needs_redis: true     # Scraper uses Redis for rate limiting
+      needs_mongodb: false
+      needs_elasticsearch: false
+
+  # ---------------------------------------------------------------------------
+  # Stage 4: Build (after all checks pass)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build & Push
+    needs: [code-coverage, scan, integration-tests]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-build.yml@main
+    with:
+      language: bunjs
+      node_version: "1.1.38"
+      docker_push: ${{ github.ref == 'refs/heads/main' }}
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: Deploy (only on main, after build succeeds)
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    uses: OferGM-job-market-intelligence/.github/.github/workflows/template-deploy.yml@main
+    with:
+      environment: staging
+      service_name: scraper-service           # ← Change per service
+      docker_image: ${{ needs.build.outputs.docker_image }}
+      health_check_path: /health
+    secrets:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_STAGING }}
+
+  # deploy-production:
+  #   name: Deploy to Production
+  #   needs: [deploy-staging]
+  #   uses: OferGM-job-market-intelligence/.github/.github/workflows/template-deploy.yml@main
+  #   with:
+  #     environment: production
+  #     service_name: scraper-service
+  #     docker_image: ${{ needs.build.outputs.docker_image }}
+  #     deployment_strategy: canary
+  #   secrets:
+  #     KUBE_CONFIG: ${{ secrets.KUBE_CONFIG_PRODUCTION }}
