@@ -191,7 +191,7 @@ User login
 
 ## 🔄 CI/CD Architecture
 
-### Pipeline Inheritance Model (L4)
+### Pipeline Inheritance Model
 
 All CI/CD logic is centralized in the `.github` repo as reusable workflows.
 Service repos contain thin ~60-line caller YAMLs that inherit by reference.
